@@ -1,35 +1,42 @@
 package zio.config
 
-import zio.{ IO, ZIO }
+import zio.config.ReadError.MissingValue
+import zio.{CanFail, IO, ZIO}
 
 private[config] trait ReadFunctions {
   // Read
   final def read[K, V, A](
     configuration: ConfigDescriptor[K, V, A]
   ): IO[ReadErrorsVector[K, V], A] = {
-    def loop[V1, B](
-      configuration: ConfigDescriptor[K, V1, B],
-      paths: Vector[K]
-    ): IO[ReadErrorsVector[K, V1], B] =
+    def loop[V1, B](configuration: ConfigDescriptor[K, V1, B],
+                    paths: Vector[K]): IO[ReadErrorsVector[K, V1], B] =
       configuration match {
         case ConfigDescriptor.Empty() => ZIO.succeed(None)
 
-        case ConfigDescriptor.Source(path, source: ConfigSource[K, V1], propertyType: PropertyType[V1, B]) =>
+        case ConfigDescriptor.Source(
+            path,
+            source: ConfigSource[K, V1],
+            propertyType: PropertyType[V1, B]
+            ) =>
           for {
             value <- source.getConfigValue(paths :+ path)
             result <- ZIO.fromEither(
-                       propertyType
-                         .read(value.value)
-                         .fold(
-                           r =>
-                             Left(
-                               singleton(
-                                 ReadError.ParseError(paths :+ path, r.value, r.typeInfo): ReadError[Vector[K], V1]
-                               )
-                             ),
-                           e => Right(e)
-                         )
-                     )
+              propertyType
+                .read(value.value)
+                .fold(
+                  r =>
+                    Left(
+                      singleton(
+                        ReadError
+                          .ParseError(paths :+ path, r.value, r.typeInfo): ReadError[
+                          Vector[K],
+                          V1
+                        ]
+                      )
+                  ),
+                  e => Right(e)
+                )
+            )
           } yield result
 
         case ConfigDescriptor.Nested(c, path) =>
@@ -43,23 +50,35 @@ private[config] trait ReadFunctions {
                 err =>
                   singleton(
                     ReadError.FatalError(paths, new RuntimeException(err))
-                  ),
+                ),
                 res => res
               )
           }
 
         // No need to add report on the default value.
         case ConfigDescriptor.Default(c, value) =>
-          loop(c, paths).fold(
-            _ => value,
-            identity
-          )
+          loop(c, paths).fold(_ => value, identity)
 
         case ConfigDescriptor.Describe(c, _) =>
           loop(c, paths)
 
         case ConfigDescriptor.Optional(c) =>
-          loop(c, paths).option
+          def isMissingValue[E](list: E): Boolean = list match {
+            case MissingValue(_) :: _ => true
+            case _                    => false
+          }
+
+          def optionalWithError[R, E, A](
+            z: ZIO[R, E, A]
+          )(implicit ev: CanFail[E]): ZIO[R, E, Option[A]] =
+            z.foldM(v => {
+              if (isMissingValue(v))
+                IO.succeed(None)
+              else
+                IO.fail(v)
+            }, a => IO.succeed(Some(a)))
+
+          optionalWithError(loop(c, paths))
 
         case ConfigDescriptor.Zip(left, right) =>
           loop(left, paths).either
@@ -72,24 +91,20 @@ private[config] trait ReadFunctions {
                       case (Left(a), Right(_))      => Left(a)
                       case (Right(_), Left(error))  => Left(error)
                       case (Left(err1), Left(err2)) => Left(concat(err1, err2))
-                    }
-                )
+                  }
+              )
             )
             .absolve
 
         case ConfigDescriptor.OrElseEither(left, right) =>
-          loop(left, paths).either.flatMap(
-            {
-              case Right(a) => ZIO.access(_ => Left(a))
-              case Left(lerr) =>
-                loop(right, paths).either.flatMap(
-                  {
-                    case Right(b)   => ZIO.access(_ => Right(b))
-                    case Left(rerr) => ZIO.fail(concat(lerr, rerr))
-                  }
-                )
-            }
-          )
+          loop(left, paths).either.flatMap({
+            case Right(a) => ZIO.access(_ => Left(a))
+            case Left(lerr) =>
+              loop(right, paths).either.flatMap({
+                case Right(b)   => ZIO.access(_ => Right(b))
+                case Left(rerr) => ZIO.fail(concat(lerr, rerr))
+              })
+          })
       }
 
     loop(configuration, Vector.empty[K])
